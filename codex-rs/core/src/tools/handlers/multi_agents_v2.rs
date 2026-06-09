@@ -39,6 +39,7 @@ mod message_tool;
 mod send_message;
 mod spawn;
 pub(crate) mod wait;
+mod workspace;
 
 pub(super) fn communication_from_tool_message(
     author: AgentPath,

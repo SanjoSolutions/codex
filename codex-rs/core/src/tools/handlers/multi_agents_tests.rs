@@ -54,12 +54,15 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
+use core_test_support::PathBufExt;
 use core_test_support::TempDirExt;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -138,6 +141,38 @@ model_reasoning_effort = "minimal"
 fn set_turn_config(turn: &mut TurnContext, config: crate::config::Config) {
     turn.multi_agent_version = config.multi_agent_version_from_features();
     turn.config = Arc::new(config);
+}
+
+fn set_turn_permission_profile_for_legacy_sandbox(
+    turn: &mut TurnContext,
+    sandbox_policy: SandboxPolicy,
+    cwd: &codex_utils_absolute_path::AbsolutePathBuf,
+) {
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, cwd);
+    let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
+    turn.permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::from_legacy_sandbox_policy(&sandbox_policy),
+        &file_system_sandbox_policy,
+        network_sandbox_policy,
+    );
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("git stdout should be UTF-8")
 }
 
 fn expect_text_output<T>(output: T) -> (String, Option<bool>)
@@ -2221,6 +2256,232 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
         .collect::<Vec<_>>();
 
     assert_eq!(notifications, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_workspace_path_retargets_child_workspace() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        task_name: String,
+        workspace: SpawnWorkspaceResult,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SpawnWorkspaceResult {
+        path: String,
+        branch: Option<String>,
+        base: Option<String>,
+        created: bool,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let parent_cwd = turn
+        .environments
+        .primary()
+        .map_or(&turn.config.cwd, |environment| &environment.cwd)
+        .clone();
+    let child_workspace = parent_cwd.join("child-worktree");
+    tokio::fs::create_dir_all(child_workspace.as_path())
+        .await
+        .expect("create child workspace");
+    set_turn_permission_profile_for_legacy_sandbox(
+        &mut turn,
+        SandboxPolicy::DangerFullAccess,
+        &parent_cwd,
+    );
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let spawn_output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "implement in the assigned workspace",
+                "task_name": "workspace_worker",
+                "workspace_path": "child-worktree"
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, success) = expect_text_output(spawn_output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn result should parse");
+    assert_eq!(result.task_name, "/root/workspace_worker");
+    assert_eq!(
+        result.workspace.path,
+        child_workspace.as_path().display().to_string()
+    );
+    assert_eq!(result.workspace.branch, None);
+    assert_eq!(result.workspace.base, None);
+    assert!(!result.workspace.created);
+    assert_eq!(success, Some(true));
+
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "workspace_worker")
+        .await
+        .expect("relative path should resolve");
+    let child_thread = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_snapshot = child_thread.config_snapshot().await;
+    assert_eq!(child_snapshot.cwd(), &child_workspace);
+    assert_eq!(
+        child_snapshot.workspace_roots,
+        vec![child_workspace.clone()]
+    );
+
+    let child_turn = child_thread.codex.session.new_default_turn().await;
+    let child_turn_cwd = child_turn
+        .environments
+        .primary()
+        .expect("child turn should have a primary environment")
+        .cwd
+        .clone();
+    assert_eq!(child_turn_cwd, child_workspace);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_git_worktree_creates_branch_and_retargets_child_workspace() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        task_name: String,
+        workspace: SpawnWorkspaceResult,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SpawnWorkspaceResult {
+        path: String,
+        branch: Option<String>,
+        base: Option<String>,
+        created: bool,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path().join("repo").abs();
+    std::fs::create_dir_all(repo_path.as_path()).expect("repo dir should be created");
+    run_git(repo_path.as_path(), &["init"]);
+    run_git(repo_path.as_path(), &["config", "user.name", "Test User"]);
+    run_git(
+        repo_path.as_path(),
+        &["config", "user.email", "test@example.com"],
+    );
+    std::fs::write(repo_path.as_path().join("README.md"), "initial\n")
+        .expect("repo file should be written");
+    run_git(repo_path.as_path(), &["add", "README.md"]);
+    run_git(repo_path.as_path(), &["commit", "-m", "Initial commit"]);
+
+    let worktree_path = temp_dir.path().join("agent-worktree").abs();
+    let mut config = (*turn.config).clone();
+    config.cwd = repo_path.clone();
+    config.workspace_roots = vec![repo_path.clone()];
+    config
+        .permissions
+        .set_workspace_roots(vec![repo_path.clone()]);
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    turn.environments
+        .turn_environments
+        .first_mut()
+        .expect("turn should have a primary environment")
+        .cwd = repo_path.clone();
+    set_turn_permission_profile_for_legacy_sandbox(
+        &mut turn,
+        SandboxPolicy::DangerFullAccess,
+        &repo_path,
+    );
+
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let spawn_output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "implement in the new git worktree",
+                "task_name": "worktree_worker",
+                "git_worktree": {
+                    "branch": "agent/worktree-task",
+                    "base": "HEAD",
+                    "path": worktree_path.as_path().display().to_string()
+                }
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, success) = expect_text_output(spawn_output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn result should parse");
+    assert_eq!(result.task_name, "/root/worktree_worker");
+    assert_eq!(
+        result.workspace.path,
+        worktree_path.as_path().display().to_string()
+    );
+    assert_eq!(
+        result.workspace.branch,
+        Some("agent/worktree-task".to_string())
+    );
+    assert_eq!(result.workspace.base, Some("HEAD".to_string()));
+    assert!(result.workspace.created);
+    assert_eq!(success, Some(true));
+    assert!(worktree_path.as_path().join("README.md").exists());
+    assert_eq!(
+        run_git(worktree_path.as_path(), &["branch", "--show-current"]).trim(),
+        "agent/worktree-task"
+    );
+
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worktree_worker")
+        .await
+        .expect("relative path should resolve");
+    let child_thread = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_snapshot = child_thread.config_snapshot().await;
+    assert_eq!(child_snapshot.cwd(), &worktree_path);
+    assert_eq!(child_snapshot.workspace_roots, vec![worktree_path.clone()]);
+
+    let child_turn = child_thread.codex.session.new_default_turn().await;
+    let child_turn_cwd = child_turn
+        .environments
+        .primary()
+        .expect("child turn should have a primary environment")
+        .cwd
+        .clone();
+    assert_eq!(child_turn_cwd, worktree_path);
 }
 
 #[tokio::test]

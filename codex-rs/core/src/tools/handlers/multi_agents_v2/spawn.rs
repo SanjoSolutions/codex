@@ -6,10 +6,14 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
+use crate::tools::handlers::multi_agents_v2::workspace::SpawnAgentGitWorktreeArgs;
+use crate::tools::handlers::multi_agents_v2::workspace::SpawnAgentWorkspaceResult;
+use crate::tools::handlers::multi_agents_v2::workspace::apply_spawn_workspace;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::Op;
 use codex_tools::ToolSpec;
+use std::path::PathBuf;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -91,6 +95,13 @@ async fn handle_spawn_agent(
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    let workspace_outcome = apply_spawn_workspace(
+        &mut config,
+        turn.as_ref(),
+        args.workspace_path.as_deref(),
+        args.git_worktree.as_ref(),
+    )
+    .await?;
 
     let spawn_source = thread_spawn_source(
         session.thread_id,
@@ -128,7 +139,7 @@ async fn handle_spawn_agent(
                 fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
                 fork_mode,
                 parent_thread_id: Some(session.thread_id),
-                environments: Some(turn.environments.to_selections()),
+                environments: Some(workspace_outcome.environments),
             },
         ),
     )
@@ -167,11 +178,15 @@ async fn handle_spawn_agent(
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
-        Ok(SpawnAgentResult::HiddenMetadata { task_name })
+        Ok(SpawnAgentResult::HiddenMetadata {
+            task_name,
+            workspace: workspace_outcome.workspace,
+        })
     } else {
         Ok(SpawnAgentResult::WithNickname {
             task_name,
             nickname,
+            workspace: workspace_outcome.workspace,
         })
     }
 }
@@ -193,6 +208,8 @@ struct SpawnAgentArgs {
     service_tier: Option<String>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
+    workspace_path: Option<PathBuf>,
+    git_worktree: Option<SpawnAgentGitWorktreeArgs>,
 }
 
 impl SpawnAgentArgs {
@@ -238,9 +255,13 @@ pub(crate) enum SpawnAgentResult {
     WithNickname {
         task_name: String,
         nickname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace: Option<SpawnAgentWorkspaceResult>,
     },
     HiddenMetadata {
         task_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace: Option<SpawnAgentWorkspaceResult>,
     },
 }
 

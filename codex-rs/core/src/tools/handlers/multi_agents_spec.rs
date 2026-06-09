@@ -384,6 +384,30 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
                 "task_name": {
                     "type": "string",
                     "description": "Canonical task name for the spawned agent."
+                },
+                "workspace": {
+                    "type": "object",
+                    "description": "Workspace assigned to the spawned agent when workspace_path or git_worktree was requested.",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the spawned agent workspace."
+                        },
+                        "branch": {
+                            "type": ["string", "null"],
+                            "description": "Git branch checked out in the spawned workspace when known."
+                        },
+                        "base": {
+                            "type": ["string", "null"],
+                            "description": "Git base ref used to create the worktree when known."
+                        },
+                        "created": {
+                            "type": "boolean",
+                            "description": "Whether spawn_agent created this workspace."
+                        }
+                    },
+                    "required": ["path", "created"],
+                    "additionalProperties": false
                 }
             },
             "required": ["task_name"],
@@ -401,6 +425,30 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
             "nickname": {
                 "type": ["string", "null"],
                 "description": "User-facing nickname for the spawned agent when available."
+            },
+            "workspace": {
+                "type": "object",
+                "description": "Workspace assigned to the spawned agent when workspace_path or git_worktree was requested.",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the spawned agent workspace."
+                    },
+                    "branch": {
+                        "type": ["string", "null"],
+                        "description": "Git branch checked out in the spawned workspace when known."
+                    },
+                    "base": {
+                        "type": ["string", "null"],
+                        "description": "Git base ref used to create the worktree when known."
+                    },
+                    "created": {
+                        "type": "boolean",
+                        "description": "Whether spawn_agent created this workspace."
+                    }
+                },
+                "required": ["path", "created"],
+                "additionalProperties": false
             }
         },
         "required": ["task_name", "nickname"],
@@ -634,6 +682,43 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
                 SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
+        (
+            "workspace_path".to_string(),
+            JsonSchema::string(Some(
+                "Existing workspace or Git worktree directory where the spawned agent should start. Relative paths resolve from the parent cwd. Mutually exclusive with git_worktree."
+                    .to_string(),
+            )),
+        ),
+        (
+            "git_worktree".to_string(),
+            JsonSchema::object(
+                BTreeMap::from([
+                    (
+                        "branch".to_string(),
+                        JsonSchema::string(Some(
+                            "New branch to create for the spawned agent worktree."
+                                .to_string(),
+                        )),
+                    ),
+                    (
+                        "base".to_string(),
+                        JsonSchema::string(Some(
+                            "Base ref for the new worktree branch. Defaults to the parent repository HEAD."
+                                .to_string(),
+                        )),
+                    ),
+                    (
+                        "path".to_string(),
+                        JsonSchema::string(Some(
+                            "Optional worktree path. Relative paths resolve from the parent cwd. Defaults to a sibling path derived from the branch name."
+                                .to_string(),
+                        )),
+                    ),
+                ]),
+                Some(vec!["branch".to_string()]),
+                Some(false.into()),
+            ),
+        ),
     ])
 }
 
@@ -725,6 +810,7 @@ You are then able to refer to this agent as `task_3` or `/root/task1/task_3` int
 The spawned agent will have the same tools as you and the ability to spawn its own subagents.
 {inherited_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
+Use `workspace_path` to start the spawned agent in an existing checkout or Git worktree. Use `git_worktree` to create a new Git worktree and branch before spawning. When either workspace option is used, the child starts with that directory as its cwd and workspace root.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message."#
     );
